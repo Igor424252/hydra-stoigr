@@ -14,7 +14,6 @@ const DEFAULT_TRACKERS = [
   'udp://explodie.org:6969/announce'
 ].map(t => `&tr=${encodeURIComponent(t)}`).join('');
 
-// Заголовки маскировки под настоящий браузер Chrome на Windows 10
 const browserHeaders = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -24,116 +23,153 @@ const browserHeaders = {
   'Referer': 'https://stoigr.org/'
 };
 
+// Функция умной очистки названий для Hydra
+function cleanGameTitle(title) {
+  if (!title) return '';
+  let clean = title;
+  const trashPatterns = [
+    /скачать\s+торрент/gi, /скачать/gi, /бесплатно/gi, /на\s+компьютер/gi, /на\s+пк/gi,
+    /русская\s+версия/gi, /механики/gi, /хатаб/gi, /xatab/gi, /rg\s+mechanics/gi,
+    /fitgirl/gi, /chovka/gi, /repack/gi, /репак/gi, /последняя\s+версия/gi, / torrent/gi
+  ];
+  trashPatterns.forEach(pattern => { clean = clean.replace(pattern, ''); });
+  clean = clean.replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '');
+  clean = clean.replace(/^[\s\-_.,|]+|[\s\-_.,|]+$/g, '');
+  return clean.replace(/\s+/g, ' ').trim();
+}
+
 async function getTotalPages() {
   try {
     const { data } = await axios.get(BASE_URL, { headers: browserHeaders, timeout: 15000 });
     const $ = cheerio.load(data);
-    
     let maxPage = 1;
-    // Ищем ссылки в блоках пагинации DLE (поддерживаем классы nav, navigation, block, pages)
     $('.navigation a, .pages a, .nav-links a, div[class*="nav"] a').each((_, el) => {
-      const text = $(el).text().trim();
-      const num = parseInt(text, 10);
-      if (!isNaN(num) && num > maxPage) {
-        maxPage = num;
-      }
+      const num = parseInt($(el).text().trim(), 10);
+      if (!isNaN(num) && num > maxPage) maxPage = num;
     });
-    
     return maxPage > 1 ? maxPage : 297; 
   } catch (err) {
-    console.error('Ошибка определения страниц. Принудительно ставим лимит: 297');
     return 297;
   }
 }
 
-async function scrape() {
-  const downloads = [];
-  console.log('Запуск глубокого парсинга stoigr.org...');
-  
-  const totalPages = await getTotalPages();
-  console.log(`Всего страниц к обработке: ${totalPages}`);
+// Функция сбора данных конкретной игры (внутренняя страница)
+async function scrapeGameDetails(item) {
+  try {
+    const innerPage = await axios.get(item.link, { headers: browserHeaders, timeout: 10000 });
+    const $inner = cheerio.load(innerPage.data);
+    
+    let title = $inner('h1').text().trim() || $inner('.story_h').text().trim() || $inner('h2').first().text().trim() || item.fallbackTitle;
+    title = cleanGameTitle(title);
+    if (!title || title.length < 3) return null;
 
-  for (let page = 1; page <= totalPages; page++) {
-    const url = page === 1 ? BASE_URL : `${BASE_URL}/page/${page}/`;
-    try {
-      console.log(`Сканирование ленты, страница ${page}/${totalPages}...`);
-      const { data } = await axios.get(url, { headers: browserHeaders, timeout: 15000 });
-      const $ = cheerio.load(data);
+    let torrentLink = $inner('a[href*="/download/"], a[href$=".torrent"], a[href*="load-torrent"], a[href*="engine/download"]').first().attr('href');
+    if (!torrentLink) {
+      torrentLink = $inner('.quote a, .download-link a, #download a, .btn-download a').first().attr('href');
+    }
+    if (!torrentLink) return null;
 
-      const gameLinks = [];
-      
-      // Ищем вообще любые ссылки, оканчивающиеся на .html (стандарт DLE для новостей игр)
-      $('a').each((_, el) => {
-        const href = $(el).attr('href');
-        let title = $(el).text().trim() || $(el).attr('title') || '';
-        
-        if (href && href.endsWith('.html')) {
-          // Отсекаем нерелевантные технические страницы DLE
-          if (!href.includes('/user/') && !href.includes('/statistics.html') && !href.includes('/rules.html')) {
-            // Формируем чистый относительный или полный путь
-            const cleanHref = href.startsWith('http') ? href : `${BASE_URL}${href.startsWith('/') ? '' : '/'}${href}`;
-            if (!gameLinks.some(g => g.link === cleanHref)) {
-              gameLinks.push({ link: cleanHref, fallbackTitle: title });
-            }
+    const idMatch = item.link.match(/(\d+)-/);
+    const pageId = idMatch ? idMatch[1] : crypto.createHash('md5').update(item.link).digest('hex').substring(0, 8);
+    const uniqueHash = crypto.createHash('sha1').update(`stoigr-game-${pageId}`).digest('hex');
+
+    let fileSize = '12 GB';
+    const innerText = $inner.text();
+    const sizeMatch = innerText.match(/(?:Размер|Размер файла|Вес):\s*([0-9.,]+\s*(?:ГБ|МБ|GB|MB|Gb|Mb))/i);
+    if (sizeMatch && sizeMatch[1]) {
+      fileSize = sizeMatch[1].trim();
+    }
+
+    const magnet = `magnet:?xt=urn:btih:${uniqueHash}&dn=${encodeURIComponent(title)}${DEFAULT_TRACKERS}`;
+
+    return {
+      title: title,
+      uris: [magnet],
+      uploadDate: new Date().toISOString(),
+      fileSize: fileSize
+    };
+  } catch (err) {
+    return null; // Игнорируем ошибку одной игры
+  }
+}
+
+// Функция сбора списка ссылок с ОДНОЙ страницы ленты
+async function scrapePageList(page) {
+  const url = page === 1 ? BASE_URL : `${BASE_URL}/page/${page}/`;
+  const links = [];
+  try {
+    const { data } = await axios.get(url, { headers: browserHeaders, timeout: 15000 });
+    const $ = cheerio.load(data);
+
+    $('a').each((_, el) => {
+      const href = $(el).attr('href');
+      let title = $(el).text().trim() || $(el).attr('title') || '';
+      if (href && href.endsWith('.html')) {
+        if (!href.includes('/user/') && !href.includes('/statistics.html') && !href.includes('/rules.html')) {
+          const cleanHref = href.startsWith('http') ? href : `${BASE_URL}${href.startsWith('/') ? '' : '/'}${href}`;
+          if (!links.some(l => l.link === cleanHref)) {
+            links.push({ link: cleanHref, fallbackTitle: title });
           }
-        }
-      });
-
-      console.log(`Найдено игр на странице ${page}: ${gameLinks.length}`);
-
-      for (const item of gameLinks) {
-        try {
-          // Делаем паузу между запросами, чтобы не вызвать падение сервера по DDoS-защите
-          await new Promise(res => setTimeout(res, 400));
-
-          const innerPage = await axios.get(item.link, { headers: browserHeaders, timeout: 10000 });
-          const $inner = cheerio.load(innerPage.data);
-          
-          // Извлекаем название из h1 или из главных DLE заголовков карточки
-          let title = $inner('h1').text().trim() || $inner('.story_h').text().trim() || $inner('h2').first().text().trim() || item.fallbackTitle;
-          if (!title || title.length < 3) continue;
-
-          // Ищем заветный торрент файл
-          let torrentLink = $inner('a[href*="/download/"], a[href$=".torrent"], a[href*="load-torrent"], a[href*="engine/download"]').first().attr('href');
-          
-          if (!torrentLink) {
-            // Запасной селектор для скачивания внутри цитат или кастомных кнопок
-            torrentLink = $inner('.quote a, .download-link a, #download a, .btn-download a').first().attr('href');
-          }
-          
-          if (!torrentLink) continue; // Без торрента в Hydra добавлять нечего
-
-          // Генерация валидного sha1 info-hash на базе ID игры из ссылки
-          const idMatch = item.link.match(/(\d+)-/);
-          const pageId = idMatch ? idMatch[1] : crypto.createHash('md5').update(item.link).digest('hex').substring(0, 8);
-          const uniqueHash = crypto.createHash('sha1').update(`stoigr-game-${pageId}`).digest('hex');
-
-          // Парсинг веса игры
-          let fileSize = '12 GB';
-          const innerText = $inner.text();
-          const sizeMatch = innerText.match(/(?:Размер|Размер файла|Вес):\s*([0-9.,]+\s*(?:ГБ|МБ|GB|MB|Gb|Mb))/i);
-          if (sizeMatch && sizeMatch[1]) {
-            fileSize = sizeMatch[1].trim();
-          }
-
-          const magnet = `magnet:?xt=urn:btih:${uniqueHash}&dn=${encodeURIComponent(title)}${DEFAULT_TRACKERS}`;
-
-          downloads.push({
-            title: title,
-            uris: [magnet],
-            uploadDate: new Date().toISOString(),
-            fileSize: fileSize
-          });
-
-        } catch (err) {
-          // Если одна из игр отдала ошибку — идем дальше
         }
       }
-    } catch (err) {
-      console.error(`Ошибка чтения хаба на странице ${page}: ${err.message}`);
-      // Даем серверу "передохнуть" в случае сбоя сети
-      await new Promise(res => setTimeout(res, 2000));
+    });
+  } catch (err) {
+    console.error(`Ошибка чтения ленты на странице ${page}`);
+  }
+  return links;
+}
+
+async function scrape() {
+  console.log('Запуск ТУРБО-параллельного парсинга stoigr.org...');
+  const totalPages = await getTotalPages();
+  console.log(`Всего страниц каталога: ${totalPages}`);
+
+  let allGameLinks = [];
+  const PAGE_CHUNK = 15; // По сколько страниц ленты парсить одновременно
+
+  // Шаг 1: Быстро собираем ВСЕ ссылки на игры со всех страниц пагинации
+  console.log('Этап 1: Параллельный сбор ссылок на игры...');
+  for (let i = 1; i <= totalPages; i += PAGE_CHUNK) {
+    const promises = [];
+    for (let j = i; j < i + PAGE_CHUNK && j <= totalPages; j++) {
+      promises.push(scrapePageList(j));
     }
+    const results = await Promise.all(promises);
+    for (const pageLinks of results) {
+      for (const item of pageLinks) {
+        if (!allGameLinks.some(g => g.link === item.link)) {
+          allGameLinks.push(item);
+        }
+      }
+    }
+    console.log(`Прогресс сбора ссылок: обработано страниц ${Math.min(i + PAGE_CHUNK - 1, totalPages)}/${totalPages}. Найдено ссылок: ${allGameLinks.length}`);
+    await new Promise(res => setTimeout(res, 300)); // Короткая пауза между пачками списков
+  }
+
+  // Шаг 2: Параллельно обходим карточки игр пачками
+  console.log(`Этап 2: Параллельный обход карточек игр (всего: ${allGameLinks.length})...`);
+  const downloads = [];
+  const GAME_CHUNK = 8; // Оптимальное количество ОДНОВРЕМЕННЫХ запросов к играм, чтобы сайт не выдал ошибку безопасности
+
+  for (let i = 0; i < allGameLinks.length; i += GAME_CHUNK) {
+    const promises = [];
+    for (let j = i; j < i + GAME_CHUNK && j < allGameLinks.length; j++) {
+      promises.push(scrapeGameDetails(allGameLinks[j]));
+    }
+
+    const results = await Promise.all(promises);
+    for (const gameData of results) {
+      if (gameData && !downloads.some(d => d.title === gameData.title)) {
+        downloads.push(gameData);
+      }
+    }
+
+    if (i % 80 === 0 || i + GAME_CHUNK >= allGameLinks.length) {
+      console.log(`Обработано игр: ${Math.min(i + GAME_CHUNK, allGameLinks.length)}/${allGameLinks.length}. В базу добавлено: ${downloads.length}`);
+    }
+
+    // Небольшая задержка, чтобы имитировать чтение человеком и обходить DDoS-защиту
+    await new Promise(res => setTimeout(res, 400));
   }
 
   const result = {
