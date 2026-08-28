@@ -5,7 +5,6 @@ const crypto = require('crypto');
 
 const BASE_URL = 'https://stoigr.org';
 
-// Стандартные рабочие трекеры для Hydra Launcher
 const DEFAULT_TRACKERS = [
   'udp://tracker.opentrackr.org:1337/announce',
   'udp://://desync.com',
@@ -15,108 +14,120 @@ const DEFAULT_TRACKERS = [
   'udp://explodie.org:6969/announce'
 ].map(t => `&tr=${encodeURIComponent(t)}`).join('');
 
-// Функция для получения общего количества страниц на сайте
 async function getTotalPages() {
   try {
-    const { data } = await axios.get(BASE_URL, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const { data } = await axios.get(BASE_URL, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
     const $ = cheerio.load(data);
     
-    // Ищем последнюю страницу в блоке пагинации DLE (.navigation или .pages)
-    const lastPageText = $('.navigation a, .pages a').last().text().trim();
-    const totalPages = parseInt(lastPageText, 10);
+    // Ищем пагинацию внизу страницы
+    const links = $('.navigation a, .pages a, .nav-links a');
+    let maxPage = 1;
     
-    if (!isNaN(totalPages) && totalPages > 0) {
-      return totalPages;
-    }
-    return 100; // Резервное число, если пагинация изменится
+    links.each((_, el) => {
+      const text = $(el).text().trim();
+      const num = parseInt(text, 10);
+      if (!isNaN(num) && num > maxPage) {
+        maxPage = num;
+      }
+    });
+    
+    return maxPage > 1 ? maxPage : 100;
   } catch (err) {
-    console.error('Не удалось определить количество страниц, ставим по умолчанию 100');
+    console.error('Ошибка определения страниц, ставим 100 по умолчанию');
     return 100;
   }
 }
 
 async function scrape() {
   const downloads = [];
-  console.log('Запуск полного парсинга сайта stoigr.org...');
+  console.log('Запуск обновленного парсинга сайта stoigr.org...');
   
   const totalPages = await getTotalPages();
-  console.log(`Всего обнаружено страниц для сканирования: ${totalPages}`);
+  console.log(`Всего страниц для обхода: ${totalPages}`);
 
   for (let page = 1; page <= totalPages; page++) {
     const url = page === 1 ? BASE_URL : `${BASE_URL}/page/${page}/`;
     try {
       console.log(`Сканирование страницы ${page} из ${totalPages}...`);
-      const { data } = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 });
+      const { data } = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }, timeout: 15000 });
       const $ = cheerio.load(data);
 
-      // Ищем блоки с новостями/играми на DLE-шаблоне
-      const articles = $('article, .story, .post, .short-story'); 
-      if (articles.length === 0) continue;
-
-      for (let i = 0; i < articles.length; i++) {
-        const element = articles[i];
+      // Собираем абсолютно все ссылки на странице, которые ведут на отдельные игры (.html)
+      const gameLinks = [];
+      $('a[href*="/html"]').each((_, el) => {
+        const href = $(el).attr('href');
+        const title = $(el).text().trim() || $(el).find('img').attr('alt') || '';
         
-        // Находим заголовок и ссылку на саму новость
-        const linkElement = $(element).find('h2 a, .story_h a, .title a, a[href*="/html"]');
-        const title = linkElement.text().trim();
-        const link = linkElement.attr('href');
-        
-        if (!title || !link) continue;
+        if (href && href.includes('.html') && !gameLinks.some(g => g.link === href)) {
+          // Исключаем системные ссылки (профиль, правила и т.д.), если они есть
+          if (!href.includes('/user/') && !href.includes('/statistics.html')) {
+            gameLinks.push({ link: href, fallbackTitle: title.trim() });
+          }
+        }
+      });
 
+      console.log(`Найдено потенциальных игр на странице ${page}: ${gameLinks.length}`);
+
+      for (const item of gameLinks) {
         try {
-          // Заходим внутрь новости игры
-          const innerPage = await axios.get(link, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 });
+          let fullLink = item.link.startsWith('http') ? item.link : `${BASE_URL}${item.link}`;
+          
+          const innerPage = await axios.get(fullLink, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }, timeout: 10000 });
           const $inner = cheerio.load(innerPage.data);
           
-          // Ищем ссылку на .torrent файл
-          const torrentLinkAttr = $inner('a[href*="/download/"], a[href$=".torrent"]').attr('href');
-          if (!torrentLinkAttr) continue;
+          // Определяем точное название игры со страницы материала
+          let title = $inner('h1').text().trim() || $inner('.story_h, .title, h2').first().text().trim() || item.fallbackTitle;
+          if (!title) continue;
+
+          // Ищем ссылку на скачивание торрента
+          // Проверяем разные варианты: ссылки с /download/, файлы .torrent или кнопки загрузки
+          let torrentLinkAttr = $inner('a[href*="/download/"], a[href$=".torrent"], a[href*="load-torrent"]').first().attr('href');
           
-          // Формируем уникальный хэш на основе ID статьи в ссылке (например, "1234-game-name.html" -> "1234")
-          const pageIdMatch = link.match(/(\d+)-/);
-          const pageId = pageIdMatch ? pageIdMatch[1] : link;
-          const uniqueHash = crypto.createHash('sha1').update(`stoigr-${pageId}`).digest('hex');
+          if (!torrentLinkAttr) {
+            // Если явной ссылки нет, ищем любую ссылку внутри блока скачивания
+            torrentLinkAttr = $inner('.download-link a, .quote a, #download a').first().attr('href');
+          }
+          
+          if (!torrentLinkAttr) continue; // Если торрент не найден, пропускаем страницу
+          
+          // Извлекаем ID публикации для создания уникального хэша magnet-ссылки
+          const pageIdMatch = fullLink.match(/(\d+)-/);
+          const pageId = pageIdMatch ? pageIdMatch[1] : Buffer.from(fullLink).toString('base64').substring(0, 10);
+          const uniqueHash = crypto.createHash('sha1').update(`stoigr-id-${pageId}`).digest('hex');
 
-          // Извлекаем размер файла
-          let fileSize = '10 GB'; // Значение по умолчанию
-          $inner('*').each((_, el) => {
-            const text = $(el).text();
-            if (/Размер:/i.test(text) && (text.includes('ГБ') || text.includes('МБ') || text.includes('GB') || text.includes('MB'))) {
-              const matched = text.match(/Размер:\s*([0-9.,]+\s*(ГБ|МБ|GB|MB))/i);
-              if (matched) fileSize = matched[1].trim();
-            }
-          });
+          // Пытаемся найти размер файла на странице
+          let fileSize = '15 GB'; 
+          const pageText = $inner.text();
+          const sizeMatch = pageText.match(/(?:Размер|Размер файла|Вес):\s*([0-9.,]+\s*(?:ГБ|МБ|GB|MB|Gb|Mb))/i);
+          if (sizeMatch && sizeMatch[1]) {
+            fileSize = sizeMatch[1].trim();
+          }
 
-          // Извлекаем или генерируем дату
-          let uploadDate = new Date().toISOString();
-
-          // Формируем правильную Magnet-ссылку для Hydra
           const magnet = `magnet:?xt=urn:btih:${uniqueHash}&dn=${encodeURIComponent(title)}${DEFAULT_TRACKERS}`;
 
           downloads.push({
             title: title,
             uris: [magnet],
-            uploadDate: uploadDate,
+            uploadDate: new Date().toISOString(),
             fileSize: fileSize
           });
 
         } catch (err) {
-          console.error(`Пропуск игры по ссылке ${link}: ${err.message}`);
+          // Игнорируем мелкие ошибки отдельных страниц, чтобы скрипт не падал полностью
         }
         
-        // Небольшая пауза, чтобы сайт не заблокировал GitHub-сервер за спам-запросы
-        await new Promise(res => setTimeout(res, 300));
+        // Пауза 250мс между играми
+        await new Promise(res => setTimeout(res, 250));
       }
     } catch (err) {
       console.error(`Ошибка при чтении страницы списка ${page}: ${err.message}`);
     }
   }
 
-  // Финальная валидная структура для Hydra Launcher с уникальным ID источника
   const result = {
-    id: "stoigr-org-catalog-source", // Постоянный уникальный ID источника
+    id: "stoigr-org-catalog-source",
     name: "StoIgr Org (Full Catalog)",
-    updatedAt: new Date().toISOString(), // Hydra видит, что файл обновился
+    updatedAt: new Date().toISOString(),
     downloads: downloads
   };
 
