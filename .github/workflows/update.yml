@@ -1,0 +1,33 @@
+name: Update Hydra Launcher Source
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # Запуск раз в неделю (в воскресенье в 00:00)
+  workflow_dispatch: # Позволяет запускать вручную в любое время
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120 # Даем скрипту до 2 часов на прочесывание всего сайта
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - name: Install dependencies
+      run: npm install axios cheerio
+
+    - name: Run Scraper Script
+      run: node scraper.js
+
+    - name: Commit and Push changes
+      run: |
+        git config --local user.email "github-actions[bot]@://github.com"
+        git config --local user.name "github-actions[bot]"
+        git add stoigr.json
+        git diff --quiet && git diff --staged --quiet || (git commit -m "Система: Полное обновление каталога stoigr.org" && git push)
